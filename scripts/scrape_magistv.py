@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Scraper MagisTV24 - Extrae streams reales HLS (Castellano)
+Versión mejorada con más debug
 """
 
 import requests
@@ -14,16 +15,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 BASE_URL = "https://magistv24.com"
 CARTELERA_URL = f"{BASE_URL}/cartelera-peliculas/"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "es-ES,es;q=0.9",
-    "Referer": BASE_URL,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Referer": "https://magistv24.com/",
+    "Connection": "keep-alive",
 }
 
-# Configuración
-MAX_PAGES = 2          # Páginas de cartelera a scrapear
-MAX_MOVIES = 40        # Límite de películas (para no saturar)
-TREMBED = 1            # 0=Latino, 1=Castellano, 2=VOSE
-WORKERS = 6            # Hilos paralelos
+MAX_PAGES = 2
+MAX_MOVIES = 30
+TREMBED = 1          # 1 = Castellano
+WORKERS = 4
 
 
 def get_session():
@@ -79,7 +81,7 @@ def scrape_list(session, max_pages=2) -> list[dict]:
                 if len(movies) >= MAX_MOVIES:
                     return movies
 
-            time.sleep(1.2)
+            time.sleep(1.0)
         except Exception as e:
             print(f"[!] Error página {page}: {e}")
             break
@@ -87,55 +89,68 @@ def scrape_list(session, max_pages=2) -> list[dict]:
     return movies
 
 
-def extract_stream(session, post_id: str) -> str | None:
-    """Extrae el master.m3u8 de la opción Castellano (trembed=1)"""
+def extract_stream(session, post_id: str, title: str = "") -> str | None:
+    """Extrae el master.m3u8 de la opción Castellano"""
     try:
-        # 1. Pedir el embed interno de MagisTV
+        # 1. Embed de MagisTV
         embed_url = f"{BASE_URL}/?trembed={TREMBED}&trid={post_id}&trtype=1"
         r = session.get(embed_url, timeout=20)
-        r.raise_for_status()
-
-        # Buscar el iframe de fastream
-        match = re.search(r'src=["\'](https?://fastream\.to/embed-[^"\']+)["\']', r.text)
-        if not match:
-            # A veces viene sin comillas o con data-src
-            match = re.search(r'(https?://fastream\.to/embed-[a-z0-9]+\.html)', r.text)
-        if not match:
+        if r.status_code != 200:
+            print(f"    → Embed status {r.status_code}")
             return None
 
-        fastream_url = match.group(1)
+        # Buscar iframe de fastream
+        match = re.search(r'(https?://(?:www\.)?fastream\.to/embed-[a-zA-Z0-9]+\.html)', r.text)
+        if not match:
+            # A veces viene escapado
+            match = re.search(r'(https?:\\/\\/fastream\.to\\/embed-[a-zA-Z0-9]+\.html)', r.text)
+            if match:
+                fastream_url = match.group(1).replace("\\/", "/")
+            else:
+                print(f"    → No se encontró iframe fastream")
+                return None
+        else:
+            fastream_url = match.group(1)
 
-        # 2. Pedir la página de fastream
-        r2 = session.get(fastream_url, timeout=20, headers={**HEADERS, "Referer": embed_url})
-        r2.raise_for_status()
+        # 2. Página de fastream
+        r2 = session.get(fastream_url, timeout=20, headers={
+            **HEADERS,
+            "Referer": embed_url
+        })
+        if r2.status_code != 200:
+            print(f"    → Fastream status {r2.status_code}")
+            return None
 
-        # 3. Extraer el master.m3u8 (está dentro del JS ofuscado)
-        # Buscamos patrones típicos de fastream
+        text = r2.text
+
+        # 3. Buscar el m3u8 (varios patrones)
         patterns = [
-            r'(https?://[^"\'\s]+?\.m3u8[^"\'\s]*)',
-            r'(https?://s\d+\.fastream\.to/hls2/[^"\'\s]+master\.m3u8[^"\'\s]*)',
+            r'(https?://[^"\'\\s]+?master\.m3u8[^"\'\\s]*)',
+            r'(https?://s\d+\.fastream\.to/[^"\'\\s]+?\.m3u8[^"\'\\s]*)',
+            r'(https?://[^"\'\\s]+?\.m3u8\?t=[^"\'\\s]+)',
+            r'sources?\s*[:=]\s*\[\s*\{\s*file\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
         ]
 
         for pat in patterns:
-            m = re.search(pat, r2.text)
+            m = re.search(pat, text, re.IGNORECASE)
             if m:
-                url = m.group(1)
-                # Limpiar posibles escapes
-                url = url.replace("\\/", "/").replace("\\u0026", "&")
-                if "master.m3u8" in url or ".m3u8" in url:
+                url = m.group(1) if m.lastindex else m.group(0)
+                url = url.replace("\\/", "/").replace("\\u0026", "&").strip("'\"")
+                if ".m3u8" in url:
                     return url
 
+        print(f"    → No se encontró m3u8 en la página de fastream")
         return None
+
     except Exception as e:
-        print(f"  [!] Error extrayendo {post_id}: {e}")
+        print(f"    → Excepción: {e}")
         return None
 
 
 def process_movie(session, movie: dict) -> dict | None:
-    stream = extract_stream(session, movie["id"])
+    stream = extract_stream(session, movie["id"], movie["title"])
     if not stream:
         return None
-
     movie["stream"] = stream
     return movie
 
@@ -144,9 +159,8 @@ def generate_m3u(movies: list[dict], filename="playlist.m3u"):
     lines = [
         "#EXTM3U",
         f"# Generado: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-        f"# Opción: Castellano (trembed={TREMBED})",
+        f"# Opción: Castellano",
         f"# Fuente: {CARTELERA_URL}",
-        "# Los enlaces caducan aprox. cada 12 horas → actualizar playlist frecuentemente",
         "",
     ]
 
@@ -167,7 +181,7 @@ def generate_m3u(movies: list[dict], filename="playlist.m3u"):
     with open(filename, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    print(f"\n[✓] Generado {filename} con {len(movies)} streams válidos")
+    print(f"\n[✓] Generado {filename} con {len(movies)} streams")
 
 
 def main():
@@ -190,10 +204,9 @@ def main():
                 print(f"  [-] Falló: {m['title']}")
 
     if not valid:
-        print("[!] No se pudo extraer ningún stream")
+        print("\n[!] No se pudo extraer ningún stream")
         sys.exit(1)
 
-    # Ordenar por el orden original
     id_order = {m["id"]: i for i, m in enumerate(movies)}
     valid.sort(key=lambda x: id_order.get(x["id"], 999))
 
